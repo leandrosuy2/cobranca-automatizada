@@ -268,62 +268,21 @@ export class ParcelService {
   }
 
   private prepareMessage(parcel: Parcela, pixData: any): { details: string; pixCode: string } {
-    const dataVencimento = new Date(parcel.data_vencimento);
     const valor = Number(parcel.valor);
     
-    // Calcula dias de atraso
-    const hoje = new Date();
-    hoje.setHours(0, 0, 0, 0);
-    const diasAtraso = Math.max(0, Math.floor((hoje.getTime() - dataVencimento.getTime()) / (1000 * 60 * 60 * 24)));
+    let details = `Olá ${parcel.contrato.cliente.nome}\n`;
+    details += `a parcela ${parcel.numero_parcela} do seu contrato encontra em aberto\n`;
+    details += `Valor Original: R$ ${valor.toFixed(2)}\n\n`;
     
-    // Calcula multa (2% do valor)
-    const valorMulta = diasAtraso > 0 ? valor * 0.02 : 0;
+    details += `Para evita acúmulo de juros e multas,\n`;
+    details += `regularize sua situação o quanto antes,\n\n`;
     
-    // Calcula juros (0.033% ao dia)
-    const valorJuros = diasAtraso > 0 ? valor * (0.00033 * diasAtraso) : 0;
-    
-    const valorTotal = valor + valorMulta + valorJuros;
-
-    let details = `Olá ${parcel.contrato.cliente.nome},\n\n`;
-    
-    if (diasAtraso > 0) {
-      details += `⚠️ *ATENÇÃO: Sua parcela está em atraso!*\n\n`;
-      details += `A parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id} está em atraso desde ${dataVencimento.toLocaleDateString()}.\n\n`;
-      details += `Para evitar acúmulo de juros e multas, regularize sua situação o quanto antes.\n\n`;
-    } else {
-      details += `Informamos que hoje vence a parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id}.\n\n`;
-      details += `Para evitar juros e multas, realize o pagamento o quanto antes.\n\n`;
-    }
-
-    details += `*Detalhes do ${diasAtraso > 0 ? 'atraso' : 'vencimento'}:*\n`;
-    details += `• Contrato: ${parcel.contrato_id}\n`;
-    details += `• Parcela: ${parcel.numero_parcela}\n`;
-    details += `• Data de Vencimento: ${dataVencimento.toLocaleDateString()}\n`;
-    details += `• Valor Original: R$ ${valor.toFixed(2)}\n`;
-    
-    if (diasAtraso > 0) {
-      details += `• Dias em Atraso: ${diasAtraso}\n`;
-      details += `• Multa (2%): R$ ${valorMulta.toFixed(2)}\n`;
-      details += `• Juros (0.033% ao dia): R$ ${valorJuros.toFixed(2)}\n`;
-    }
-    
-    details += `• Valor Total: R$ ${valorTotal.toFixed(2)}\n\n`;
-    
-    details += `*Instruções:*\n`;
+    details += `Instruções\n`;
     details += `1. Abra o aplicativo do seu banco\n`;
     details += `2. Escolha a opção PIX\n`;
     details += `3. Escolha "PIX Copia e Cola"\n`;
-    details += `4. Cole o código que será enviado na próxima mensagem\n`;
-    details += `5. Confirme o pagamento\n\n`;
-    
-    if (diasAtraso > 0) {
-      details += `Em caso de dúvidas ou para negociar, entre em contato conosco imediatamente.\n\n`;
-    } else {
-      details += `Em caso de dúvidas, entre em contato conosco.\n\n`;
-    }
-    
-    details += `Atenciosamente,\nEquipe de Cobrança\n\n`;
-    details += `*Código PIX para Copiar e Colar:*`;
+    details += `4. Cole o código acima\n`;
+    details += `5. Confirme o pagamento`;
 
     const pixCode = pixData.pix_code;
 
