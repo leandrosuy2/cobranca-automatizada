@@ -7,6 +7,7 @@ import { WhatsAppService } from './whatsapp.service';
 import { MercadoPagoService } from './mercadopago.service';
 import axios from 'axios';
 import * as qrcode from 'qrcode';
+import { Between } from 'typeorm';
 
 @Injectable()
 export class ParcelService {
@@ -99,11 +100,16 @@ export class ParcelService {
         this.logger.debug(`Parcela ${parcel.id} ainda não foi paga. Verificando se já enviamos mensagem hoje...`);
       }
 
-      // Check if message was already sent today
+      // Verifica se já foi enviada mensagem hoje para este cliente
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+
       const messageSent = await this.controleEmailsRepository.findOne({
         where: {
           cliente_id: parcel.contrato.cliente.id,
-          data_envio: new Date()
+          data_envio: Between(today, tomorrow)
         }
       });
 
@@ -112,99 +118,142 @@ export class ParcelService {
         return;
       }
 
-      let pixData;
-      // Se já tem payment_id, usa os dados existentes
-      if (parcel.payment_id) {
-        this.logger.debug(`Parcela ${parcel.id} já tem payment_id ${parcel.payment_id}. Reenviando mensagem.`);
-        // Busca os dados do pagamento no Mercado Pago
-        const paymentResponse = await axios.get(
-          `${this.mercadoPagoService['apiUrl']}/v1/payments/${parcel.payment_id}`,
-          {
-            headers: {
-              'Authorization': `Bearer ${this.mercadoPagoService['accessToken']}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
+      // Inicia uma transação para garantir atomicidade
+      const queryRunner = this.controleEmailsRepository.manager.connection.createQueryRunner();
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
 
-        const payment = paymentResponse.data;
-        const transactionData = payment.point_of_interaction?.transaction_data;
-        
-        if (!transactionData?.qr_code) {
-          this.logger.error('QR code não encontrado na resposta do Mercado Pago');
+      try {
+        // Verifica novamente dentro da transação
+        const messageSentInTransaction = await queryRunner.manager.findOne(ControleEmails, {
+          where: {
+            cliente_id: parcel.contrato.cliente.id,
+            data_envio: Between(today, tomorrow)
+          }
+        });
+
+        if (messageSentInTransaction) {
+          this.logger.debug(`Mensagem já enviada hoje para o cliente ${parcel.contrato.cliente.id} (verificação em transação)`);
+          await queryRunner.rollbackTransaction();
           return;
         }
 
-        // Gera a imagem do QR code
-        const qrCodeImage = await qrcode.toDataURL(transactionData.qr_code);
+        let pixData;
+        // Se já tem payment_id, usa os dados existentes
+        if (parcel.payment_id) {
+          this.logger.debug(`Parcela ${parcel.id} já tem payment_id ${parcel.payment_id}. Reenviando mensagem.`);
+          // Busca os dados do pagamento no Mercado Pago
+          const paymentResponse = await axios.get(
+            `${this.mercadoPagoService['apiUrl']}/v1/payments/${parcel.payment_id}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${this.mercadoPagoService['accessToken']}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
 
-        pixData = {
-          qr_code: transactionData.qr_code,
-          qr_code_image: qrCodeImage,
-          payment_id: parcel.payment_id,
-          pix_code: transactionData.qr_code
-        };
-      } else {
-        // Generate new PIX QR code
-        const descricao = `Parcela ${parcel.numero_parcela} - Contrato ${parcel.contrato_id}${isOverdue ? ' (ATRASADA)' : ''}`;
-        const referencia = `CONTRATO_${parcel.contrato_id}_PARCELA_${parcel.numero_parcela}${isOverdue ? '_ATRASADA' : ''}`;
-        
-        // Garante que o valor seja um número
-        const valor = Number(parcel.valor);
-        
-        pixData = await this.mercadoPagoService.generatePixQRCode(
-          valor,
-          descricao,
-          referencia,
-          {
-            nome: parcel.contrato.cliente.nome,
-            email: parcel.contrato.cliente.email,
-            cpf: parcel.contrato.cliente.cpf,
-            telefone: parcel.contrato.cliente.whatsapp
+          const payment = paymentResponse.data;
+          const transactionData = payment.point_of_interaction?.transaction_data;
+          
+          if (!transactionData?.qr_code) {
+            this.logger.error('QR code não encontrado na resposta do Mercado Pago');
+            return;
           }
-        );
+
+          // Gera a imagem do QR code
+          const qrCodeImage = await qrcode.toDataURL(transactionData.qr_code);
+
+          pixData = {
+            qr_code: transactionData.qr_code,
+            qr_code_image: qrCodeImage,
+            payment_id: parcel.payment_id,
+            pix_code: transactionData.qr_code
+          };
+        } else {
+          // Generate new PIX QR code
+          const descricao = `Parcela ${parcel.numero_parcela} - Contrato ${parcel.contrato_id}${isOverdue ? ' (ATRASADA)' : ''}`;
+          const referencia = `CONTRATO_${parcel.contrato_id}_PARCELA_${parcel.numero_parcela}${isOverdue ? '_ATRASADA' : ''}`;
+          
+          // Garante que o valor seja um número
+          const valor = Number(parcel.valor);
+          
+          pixData = await this.mercadoPagoService.generatePixQRCode(
+            valor,
+            descricao,
+            referencia,
+            {
+              nome: parcel.contrato.cliente.nome,
+              email: parcel.contrato.cliente.email,
+              cpf: parcel.contrato.cliente.cpf,
+              telefone: parcel.contrato.cliente.whatsapp
+            }
+          );
+
+          if (pixData) {
+            // Update payment_id in parcel
+            parcel.payment_id = pixData.payment_id;
+            await this.parcelRepository.save(parcel);
+          }
+        }
 
         if (pixData) {
-          // Update payment_id in parcel
-          parcel.payment_id = pixData.payment_id;
-          await this.parcelRepository.save(parcel);
-        }
-      }
+          // Prepare messages
+          const messages = this.prepareMessage(parcel, pixData);
 
-      if (pixData) {
-        // Prepare message
-        const message = this.prepareMessage(parcel, pixData);
+          // Send WhatsApp messages
+          const sentDetails = await this.whatsappService.sendMessage(
+            parcel.contrato.cliente.whatsapp,
+            messages.details
+          );
 
-        // Send WhatsApp message
-        const sent = await this.whatsappService.sendMessage(
-          parcel.contrato.cliente.whatsapp,
-          message,
-          pixData.qr_code_image
-        );
-
-        if (sent) {
-          try {
-            // Cria um novo registro de controle de emails
-            const controleEmail = new ControleEmails();
-            controleEmail.cliente_id = parcel.contrato.cliente.id;
-            controleEmail.data_envio = new Date();
+          if (sentDetails) {
+            // Wait 1 second before sending the PIX code
+            await new Promise(resolve => setTimeout(resolve, 1000));
             
-            // Salva o registro
-            await this.controleEmailsRepository.save(controleEmail);
-            
-            this.logger.debug(`Registro de envio salvo para o cliente ${parcel.contrato.cliente.id}`);
+            const sentPixCode = await this.whatsappService.sendMessage(
+              parcel.contrato.cliente.whatsapp,
+              messages.pixCode
+            );
 
-            // Check payment status after 30 seconds
-            setTimeout(async () => {
-              const isPaid = await this.mercadoPagoService.checkPaymentStatus(pixData.payment_id);
-              if (isPaid) {
-                await this.updateParcelStatus(parcel);
+            if (sentPixCode) {
+              try {
+                // Cria um novo registro de controle de emails dentro da transação
+                const controleEmail = new ControleEmails();
+                controleEmail.cliente_id = parcel.contrato.cliente.id;
+                controleEmail.data_envio = new Date();
+                
+                // Salva o registro dentro da transação
+                await queryRunner.manager.save(controleEmail);
+                
+                // Commit da transação
+                await queryRunner.commitTransaction();
+                
+                this.logger.debug(`Registro de envio salvo para o cliente ${parcel.contrato.cliente.id}`);
+
+                // Check payment status after 30 seconds
+                setTimeout(async () => {
+                  const isPaid = await this.mercadoPagoService.checkPaymentStatus(pixData.payment_id);
+                  if (isPaid) {
+                    await this.updateParcelStatus(parcel);
+                  }
+                }, 30000);
+              } catch (error) {
+                await queryRunner.rollbackTransaction();
+                this.logger.error(`Erro ao salvar registro de envio: ${error.message}`);
               }
-            }, 30000);
-          } catch (error) {
-            this.logger.error(`Erro ao salvar registro de envio: ${error.message}`);
+            } else {
+              await queryRunner.rollbackTransaction();
+            }
+          } else {
+            await queryRunner.rollbackTransaction();
           }
         }
+      } catch (error) {
+        await queryRunner.rollbackTransaction();
+        throw error;
+      } finally {
+        await queryRunner.release();
       }
     } catch (error) {
       // Safely stringify error object without circular references
@@ -218,7 +267,7 @@ export class ParcelService {
     }
   }
 
-  private prepareMessage(parcel: Parcela, qrCodeData: any): string {
+  private prepareMessage(parcel: Parcela, pixData: any): { details: string; pixCode: string } {
     const dataVencimento = new Date(parcel.data_vencimento);
     const valor = Number(parcel.valor);
     
@@ -235,52 +284,50 @@ export class ParcelService {
     
     const valorTotal = valor + valorMulta + valorJuros;
 
-    let message = `Olá ${parcel.contrato.cliente.nome},\n\n`;
+    let details = `Olá ${parcel.contrato.cliente.nome},\n\n`;
     
     if (diasAtraso > 0) {
-      message += `⚠️ *ATENÇÃO: Sua parcela está em atraso!*\n\n`;
-      message += `A parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id} está em atraso desde ${dataVencimento.toLocaleDateString()}.\n\n`;
-      message += `Para evitar acúmulo de juros e multas, regularize sua situação o quanto antes.\n\n`;
+      details += `⚠️ *ATENÇÃO: Sua parcela está em atraso!*\n\n`;
+      details += `A parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id} está em atraso desde ${dataVencimento.toLocaleDateString()}.\n\n`;
+      details += `Para evitar acúmulo de juros e multas, regularize sua situação o quanto antes.\n\n`;
     } else {
-      message += `Informamos que hoje vence a parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id}.\n\n`;
-      message += `Para evitar juros e multas, realize o pagamento o quanto antes.\n\n`;
+      details += `Informamos que hoje vence a parcela ${parcel.numero_parcela} do seu contrato ${parcel.contrato_id}.\n\n`;
+      details += `Para evitar juros e multas, realize o pagamento o quanto antes.\n\n`;
     }
 
-    message += `*Detalhes do ${diasAtraso > 0 ? 'atraso' : 'vencimento'}:*\n`;
-    message += `• Contrato: ${parcel.contrato_id}\n`;
-    message += `• Parcela: ${parcel.numero_parcela}\n`;
-    message += `• Data de Vencimento: ${dataVencimento.toLocaleDateString()}\n`;
-    message += `• Valor Original: R$ ${valor.toFixed(2)}\n`;
+    details += `*Detalhes do ${diasAtraso > 0 ? 'atraso' : 'vencimento'}:*\n`;
+    details += `• Contrato: ${parcel.contrato_id}\n`;
+    details += `• Parcela: ${parcel.numero_parcela}\n`;
+    details += `• Data de Vencimento: ${dataVencimento.toLocaleDateString()}\n`;
+    details += `• Valor Original: R$ ${valor.toFixed(2)}\n`;
     
     if (diasAtraso > 0) {
-      message += `• Dias em Atraso: ${diasAtraso}\n`;
-      message += `• Multa (2%): R$ ${valorMulta.toFixed(2)}\n`;
-      message += `• Juros (0.033% ao dia): R$ ${valorJuros.toFixed(2)}\n`;
+      details += `• Dias em Atraso: ${diasAtraso}\n`;
+      details += `• Multa (2%): R$ ${valorMulta.toFixed(2)}\n`;
+      details += `• Juros (0.033% ao dia): R$ ${valorJuros.toFixed(2)}\n`;
     }
     
-    message += `• Valor Total: R$ ${valorTotal.toFixed(2)}\n\n`;
+    details += `• Valor Total: R$ ${valorTotal.toFixed(2)}\n\n`;
     
-    message += `*Código PIX para Copiar e Colar:*\n`;
-    message += `${qrCodeData.pix_code}\n\n`;
-    
-    message += `*Instruções:*\n`;
-    message += `1. Abra o aplicativo do seu banco\n`;
-    message += `2. Escolha a opção PIX\n`;
-    message += `3. Escolha "PIX Copia e Cola"\n`;
-    message += `4. Cole o código acima\n`;
-    message += `5. Confirme o pagamento\n\n`;
-    
-    message += `Ou escaneie o QR Code que será enviado em seguida.\n\n`;
+    details += `*Instruções:*\n`;
+    details += `1. Abra o aplicativo do seu banco\n`;
+    details += `2. Escolha a opção PIX\n`;
+    details += `3. Escolha "PIX Copia e Cola"\n`;
+    details += `4. Cole o código que será enviado na próxima mensagem\n`;
+    details += `5. Confirme o pagamento\n\n`;
     
     if (diasAtraso > 0) {
-      message += `Em caso de dúvidas ou para negociar, entre em contato conosco imediatamente.\n\n`;
+      details += `Em caso de dúvidas ou para negociar, entre em contato conosco imediatamente.\n\n`;
     } else {
-      message += `Em caso de dúvidas, entre em contato conosco.\n\n`;
+      details += `Em caso de dúvidas, entre em contato conosco.\n\n`;
     }
     
-    message += `Atenciosamente,\nEquipe de Cobrança`;
+    details += `Atenciosamente,\nEquipe de Cobrança\n\n`;
+    details += `*Código PIX para Copiar e Colar:*`;
 
-    return message;
+    const pixCode = pixData.pix_code;
+
+    return { details, pixCode };
   }
 
   private async updateParcelStatus(parcel: Parcela): Promise<void> {

@@ -1,8 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
-import * as qrcode from 'qrcode';
-import { Buffer } from 'buffer';
 import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
@@ -19,6 +17,45 @@ export class MercadoPagoService {
     }
   }
 
+  private isValidCPF(cpf: string): boolean {
+    // Remove caracteres não numéricos
+    cpf = cpf.replace(/\D/g, '');
+
+    // Verifica se tem 11 dígitos
+    if (cpf.length !== 11) {
+      return false;
+    }
+
+    // Verifica se todos os dígitos são iguais
+    if (/^(\d)\1+$/.test(cpf)) {
+      return false;
+    }
+
+    // Validação do primeiro dígito verificador
+    let sum = 0;
+    for (let i = 0; i < 9; i++) {
+      sum += parseInt(cpf.charAt(i)) * (10 - i);
+    }
+    let rest = 11 - (sum % 11);
+    let digit1 = rest > 9 ? 0 : rest;
+    if (digit1 !== parseInt(cpf.charAt(9))) {
+      return false;
+    }
+
+    // Validação do segundo dígito verificador
+    sum = 0;
+    for (let i = 0; i < 10; i++) {
+      sum += parseInt(cpf.charAt(i)) * (11 - i);
+    }
+    rest = 11 - (sum % 11);
+    let digit2 = rest > 9 ? 0 : rest;
+    if (digit2 !== parseInt(cpf.charAt(10))) {
+      return false;
+    }
+
+    return true;
+  }
+
   async generatePixQRCode(
     valor: number, 
     descricao: string, 
@@ -30,13 +67,32 @@ export class MercadoPagoService {
       telefone?: string;
     }
   ): Promise<{
-    qr_code: string;
-    qr_code_image: string;
     payment_id: string;
     pix_code: string;
   } | null> {
     try {
-      this.logger.debug(`Gerando QR Code PIX para valor: ${valor}, descrição: ${descricao}`);
+      this.logger.debug(`Gerando código PIX para valor: ${valor}, descrição: ${descricao}`);
+
+      // Formata e valida o CPF
+      let formattedCpf: string | undefined;
+      if (cliente.cpf) {
+        this.logger.debug(`CPF original recebido: ${cliente.cpf}`);
+        
+        // Remove todos os caracteres não numéricos
+        const cpfNumbers = cliente.cpf.replace(/\D/g, '');
+        this.logger.debug(`CPF após remoção de caracteres não numéricos: ${cpfNumbers}`);
+        
+        // Verifica se o CPF é válido
+        if (!this.isValidCPF(cpfNumbers)) {
+          this.logger.error(`CPF inválido: ${cliente.cpf} - Não passou na validação do algoritmo de CPF`);
+          return null;
+        }
+        
+        formattedCpf = cpfNumbers;
+        this.logger.debug(`CPF formatado final: ${formattedCpf}`);
+      } else {
+        this.logger.debug('Nenhum CPF fornecido para o cliente');
+      }
 
       const paymentData = {
         transaction_amount: Number(valor),
@@ -46,9 +102,9 @@ export class MercadoPagoService {
           email: cliente.email,
           first_name: cliente.nome.split(' ')[0],
           last_name: cliente.nome.split(' ').slice(1).join(' '),
-          identification: cliente.cpf ? {
+          identification: formattedCpf ? {
             type: 'CPF',
-            number: cliente.cpf.replace(/\D/g, '')
+            number: formattedCpf
           } : undefined,
           phone: cliente.telefone ? {
             area_code: cliente.telefone.replace(/\D/g, '').substring(0, 2),
@@ -59,7 +115,7 @@ export class MercadoPagoService {
         date_of_expiration: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
       };
 
-      this.logger.debug('Dados do pagamento:', paymentData);
+      this.logger.debug('Dados do pagamento:', JSON.stringify(paymentData, null, 2));
 
       // Gera um ID único para idempotência
       const idempotencyKey = uuidv4();
@@ -91,21 +147,13 @@ export class MercadoPagoService {
 
       const transactionData = payment.point_of_interaction?.transaction_data;
       if (!transactionData?.qr_code) {
-        this.logger.error('QR code não encontrado na resposta');
+        this.logger.error('Código PIX não encontrado na resposta');
         return null;
       }
 
-      // Gera a imagem do QR code
-      const qrCodeImage = await qrcode.toDataURL(transactionData.qr_code);
-
-      // Extrai o código PIX do QR code
-      const pixCode = transactionData.qr_code;
-
       return {
-        qr_code: transactionData.qr_code,
-        qr_code_image: qrCodeImage,
         payment_id: payment.id.toString(),
-        pix_code: pixCode
+        pix_code: transactionData.qr_code
       };
     } catch (error) {
       if (error.response) {
@@ -114,15 +162,15 @@ export class MercadoPagoService {
             errorData.error === 'bad_request' && 
             errorData.message?.includes('Collector user without key enabled for QR render')) {
           this.logger.error(
-            'Erro: Conta do Mercado Pago não tem permissão para gerar QR Code. ' +
-            'Por favor, acesse sua conta do Mercado Pago e habilite a funcionalidade de QR Code. ' +
+            'Erro: Conta do Mercado Pago não tem permissão para gerar código PIX. ' +
+            'Por favor, acesse sua conta do Mercado Pago e habilite a funcionalidade de PIX. ' +
             'Você pode precisar completar a verificação da conta e solicitar permissões adicionais.'
           );
         } else {
           this.logger.error(`Erro na API do Mercado Pago: ${error.response.status} - ${JSON.stringify(errorData)}`);
         }
       } else {
-        this.logger.error(`Erro ao gerar QR Code PIX: ${error.message}`);
+        this.logger.error(`Erro ao gerar código PIX: ${error.message}`);
       }
       return null;
     }

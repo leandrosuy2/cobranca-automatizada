@@ -28,7 +28,7 @@ export class WhatsAppService {
     }
   }
 
-  async sendMessage(phoneNumber: string, message: string, qrCodeImage?: string): Promise<boolean> {
+  async sendMessage(phoneNumber: string, message: string): Promise<boolean> {
     try {
       // Clean phone number
       const originalNumber = phoneNumber;
@@ -69,44 +69,6 @@ export class WhatsAppService {
       if (textResponse.status !== 200 && textResponse.status !== 201) {
         this.logger.error(`Falha ao enviar mensagem de texto: ${JSON.stringify(textResponse.data)}`);
         return false;
-      }
-
-      // If QR code image is provided, send it
-      if (qrCodeImage) {
-        this.logger.debug('Preparando envio da imagem do QR code...');
-        
-        // Remove o prefixo data:image/png;base64, se existir
-        const base64Image = qrCodeImage.replace(/^data:image\/\w+;base64,/, '');
-        
-        const imagePayload = {
-          number: phoneNumber,
-          mediatype: 'image',
-          media: base64Image,
-          caption: 'QR Code PIX para pagamento'
-        };
-
-        this.logger.debug(`Enviando imagem para ${this.apiUrl}/message/sendMedia/${this.instanceId}`);
-        this.logger.debug(`Tamanho da imagem em base64: ${base64Image.length} caracteres`);
-
-        const imageResponse = await axios.post(
-          `${this.apiUrl}/message/sendMedia/${this.instanceId}`,
-          imagePayload,
-          { 
-            headers,
-            httpsAgent: new (require('https').Agent)({  
-              rejectUnauthorized: false
-            })
-          }
-        );
-
-        this.logger.debug(`Resposta do envio de imagem: ${JSON.stringify(imageResponse.data)}`);
-
-        if (imageResponse.status !== 200 && imageResponse.status !== 201) {
-          this.logger.error(`Falha ao enviar imagem do QR code: ${JSON.stringify(imageResponse.data)}`);
-          return false;
-        }
-
-        this.logger.debug('QR code enviado com sucesso');
       }
 
       this.logger.debug(`Mensagem enviada com sucesso para ${phoneNumber}`);
